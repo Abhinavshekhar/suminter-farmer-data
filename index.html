@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SUMINTER INDIA — Farmer Registration</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+/* ===================== SUPABASE CLIENT ===================== */
+const SUPABASE_URL = 'https://lbxzpvtpyghishlorgfq.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxieHpwdnRweWdoaXNobG9yZ2ZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ5NjQ0MzAsImV4cCI6MjEwMDU0MDQzMH0.OEhTRFEsxMHgLgAGxsVG6u88LIJuRf1GD7iP_dSqHYI';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const DOCS_BUCKET = 'farmer-documents';
+
+/* ===================== STATE ===================== */
+const DISTRICTS = { "Madhya Pradesh": ["Neemuch"], "Rajasthan": ["Chittorgarh","Pratapgarh"] };
+const ALL_DISTRICTS = ["Chittorgarh","Pratapgarh","Neemuch"];
+
+let state = {
+  view: 'loading',          // loading | login | dashboard | form | detail
+  user: null,               // {id, name, role}
+  farmers: [],
+  detailId: null,
+  editId: null,
+  wizard: { step: 1, data: {}, errors: {} },
+  filters: { q:'', state:'', district:'', from:'', to:'' },
+  sort: { col:'createdAt', dir:'desc' },
+  revealAadharId: null,
+  authMode: 'signin',       // signin | signup
+  busy: false,
+  authError: null,
+};
+
+let _farmerSeq = 0;
+function genFarmerId(){
+  _farmerSeq += 1;
+  return 'SI-' + new Date().getFullYear() + '-' + String(_farmerSeq).padStart(4,'0');
+}
+function maskAadhar(a){ return a ? '•••• •••• ' + a.slice(-4) : '—'; }
+function fmtDate(d){ const dt = new Date(d); return dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}); }
+function fileToDataUrl(file){ return new Promise((res)=>{ const r = new FileReader(); r.onload = ()=>res(r.result); r.readAsDataURL(file); }); }
+
+/* Map a DB row (snake_case) to the app's internal camelCase record shape */
+function rowToFarmer(row){
+  return {
+    id: row.id,
+    farmerName: row.farmer_name, fatherName: row.father_name,
+    aadhar: row.aadhar_number, mobile: row.mobile_number,
+    village: row.village, district: row.district, state: row.state,
+    aadharDoc: row.aadhar_document_path ? { path: row.aadhar_document_path, name: row.aadhar_document_path.split('/').pop() } : null,
+    latitude: +row.latitude, longitude: +row.longitude,
+    khasaraNumber: row.khasara_number, areaHectares: +row.area_hectares,
+    nakalDocs: (row.nakal_document_paths||[]).map(p => ({ path:p, name: p.split('/').pop() })),
+    consent: row.consent, createdAt: row.created_at, createdBy: row.created_by_name,
+  };
+}
+
+/* ===================== DATA LOADING ===================== */
+async function loadFarmers(){
+  const { data, error } = await sb.from('farmers').select('*').order('created_at', {ascending:false});
+  if (error){ console.error(error); alert('Could not load farmer records: ' + error.message); return; }
+  state.farmers = (data||[]).map(rowToFarmer);
+  const nums = state.farmers.map(f => parseInt((f.id.split('-').pop()||'0'),10)).filter(n=>!isNaN(n));
+  _farmerSeq = nums.length ? Math.max(...nums) : 0;
+}
+
+async function loadProfile(userId){
+  const { data, error } = await sb.from('profiles').select('*').eq('id', userId).maybeSingle();
+  if (error){ console.error(error); return null; }
+  return data;
+}
+
+async function bootstrap(){
+  const { data: { session } } = await sb.auth.getSession();
+  if (session && session.user){
+    const profile = await loadProfile(session.user.id);
+    if (profile){
+      state.user = { id: session.user.id, name: profile.full_name, role: profile.role };
+      await loadFarmers();
+      state.view = 'dashboard';
+      render();
+      return;
+    }
+  }
+  state.view = 'login';
+  render();
+}
+
+/* ===================== RENDER ROOT ===================== */
+function render(){
+  const app = document.getElementById('app');
+  if (state.view === 'loading'){ app.innerHTML = `<div class="login-wrap"><p class="muted">Loading…</p></div>`; return; }
+  if (state.view === 'login'){ app.innerHTML = renderLogin(); attachLoginEvents(); return; }
+  app.innerHTML = renderTopbar() + renderBody();
+  attachBodyEvents();
+}
+
+function go(view, extra){ state.view = view; if(extra) Object.assign(state, extra); render(); window.scrollTo(0,0); }
+
+/* ===================== TOPBAR ===================== */
+function renderTopbar(){
+  const u = state.user;
+  return `
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark">SI</div>
+        <div class="brand-text">
+          <div class="name">SUMINTER INDIA</div>
+          <div class="tag">Farmer Registration</div>
+        </div>
+      </div>
+      <div class="topbar-nav">
+        <button class="navbtn ${state.view==='dashboard'?'active':''}" onclick="go('dashboard')">Dashboard</button>
+        <button class="navbtn ${state.view==='form'?'active':''}" onclick="startForm()">+ New Farmer</button>
+        ${u.role==='admin' ? `<button class="navbtn ${state.view==='team'?'active':''}" onclick="openTeam()">Team</button>` : ``}
+        <div class="userchip">
+          <span>${u.name}</span><span class="role">${u.role === 'admin' ? 'Admin' : 'Field Staff'}</span>
+          <button class="logout" onclick="logout()">Log out</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderBody(){
+  if (state.view === 'dashboard') return renderDashboard();
+  if (state.view === 'form') return renderForm();
+  if (state.view === 'detail') return renderDetail();
+  if (state.view === 'team') return renderTeam();
+  return '';
+}
+
+/* ===================== LOGIN ===================== */
+function renderLogin(){
+  return `
+  <div class="login-wrap">
+    <div class="card login-card">
+      <div class="brand-mark">SI</div>
+      <div class="eyebrow">Suminter India</div>
+      <h1>Farmer Registration Portal</h1>
+      <p class="muted" style="font-size:13.5px;margin:6px 0 22px;">${state.authMode==='signup' ? 'Create an account to register farmers and manage land records.' : 'Sign in to register farmers and manage land records across Chittorgarh, Pratapgarh &amp; Neemuch.'}</p>
+
+      ${state.authMode==='signup' ? `
+      <div class="field ${state._loginErr==='name'?'has-error':''}">
+        <label>Your name <span class="req">*</span></label>
+        <input id="loginName" type="text" placeholder="e.g. Anita Verma" />
+        <div class="err">Please enter your name.</div>
+      </div>` : ``}
+
+      ${state.authMode==='signup' ? `<p class="muted" style="font-size:12px;margin:-4px 0 14px;">New accounts start as Field Staff. An existing Admin can promote you from the Team page.</p>` : ``}
+
+      <div class="field ${state._loginErr==='email'?'has-error':''}">
+        <label>Email <span class="req">*</span></label>
+        <input id="loginEmail" type="email" placeholder="you@example.com" />
+        <div class="err">Please enter a valid email.</div>
+      </div>
+      <div class="field ${state._loginErr==='password'?'has-error':''}">
+        <label>Password <span class="req">*</span></label>
+        <input id="loginPassword" type="password" placeholder="At least 6 characters" />
+        <div class="err">Password must be at least 6 characters.</div>
+      </div>
+      ${state.authError ? `<div class="field has-error" style="margin-top:-8px;"><div class="err">${state.authError}</div></div>` : ``}
+
+      <button class="btn btn-primary" style="width:100%;margin-top:6px;" ${state.busy?'disabled':''} onclick="${state.authMode==='signup'?'doSignUp()':'doSignIn()'}">
+        ${state.busy ? 'Please wait…' : (state.authMode==='signup' ? 'Create account' : 'Sign in')}
+      </button>
+      <p class="muted" style="font-size:13px;margin-top:16px;text-align:center;">
+        ${state.authMode==='signup'
+          ? `Already have an account? <a href="#" onclick="switchAuthMode('signin');return false;" style="color:var(--primary);font-weight:600;">Sign in</a>`
+          : `New to the team? <a href="#" onclick="switchAuthMode('signup');return false;" style="color:var(--primary);font-weight:600;">Create an account</a>`}
+      </p>
+    </div>
+  </div>`;
+}
+function attachLoginEvents(){
+  const submit = () => state.authMode==='signup' ? doSignUp() : doSignIn();
+  ['loginEmail','loginPassword','loginName'].forEach(id=>{
+    const inp = document.getElementById(id);
+    if (inp) inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter') submit(); });
+  });
+}
+function switchAuthMode(mode){ state.authMode = mode; state.authError=null; state._loginErr=null; render(); }
+
+async function doSignIn(){
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  state._loginErr = null; state.authError = null;
+  if (!email){ state._loginErr='email'; render(); return; }
+  if (!password || password.length<6){ state._loginErr='password'; render(); return; }
+  state.busy = true; render();
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  state.busy = false;
+  if (error){ state.authError = error.message; render(); return; }
+  const profile = await loadProfile(data.user.id);
+  if (!profile){ state.authError = 'No profile found for this account. Please contact an admin.'; render(); return; }
+  state.user = { id: data.user.id, name: profile.full_name, role: profile.role };
+  await loadFarmers();
+  go('dashboard');
+}
+
+async function doSignUp(){
+  const name = document.getElementById('loginName').value.trim();
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  state._loginErr = null; state.authError = null;
+  if (!name){ state._loginErr='name'; render(); return; }
+  if (!email){ state._loginErr='email'; render(); return; }
+  if (!password || password.length<6){ state._loginErr='password'; render(); return; }
+  state.busy = true; render();
+  const { data, error } = await sb.auth.signUp({ email, password });
+  if (error){ state.busy=false; state.authError = error.message; render(); return; }
+  if (!data.session){
+    state.busy = false;
+    state.authError = 'Account created — check your email to confirm, then sign in. (Or turn off "Confirm email" in Supabase Auth settings for instant demo sign-ups.)';
+    state.authMode = 'signin';
+    render();
+    return;
+  }
+  // Every self-signup is Field Staff. The database also enforces this (an insert
+  // trying to set role='admin' from the client would be rejected), so this isn't
+  // just a UI restriction — promotion to Admin can only happen via the Team page.
+  const { error: profErr } = await sb.from('profiles').insert({ id: data.user.id, full_name: name, role: 'field_staff' });
+  state.busy = false;
+  if (profErr){ state.authError = profErr.message; render(); return; }
+  state.user = { id: data.user.id, name, role: 'field_staff' };
+  await loadFarmers();
+  go('dashboard');
+}
+
+async function logout(){ await sb.auth.signOut(); state.user=null; state.farmers=[]; go('login'); }
+
+/* ===================== DASHBOARD ===================== */
+function filteredFarmers(){
+  let list = [...state.farmers];
+  const f = state.filters;
+  if (f.q){
+    const q = f.q.toLowerCase();
+    list = list.filter(r => r.farmerName.toLowerCase().includes(q) || r.village.toLowerCase().includes(q) || r.id.toLowerCase().includes(q) || r.khasaraNumber.toLowerCase().includes(q));
+  }
+  if (f.state) list = list.filter(r=>r.state===f.state);
+  if (f.district) list = list.filter(r=>r.district===f.district);
+  if (f.from) list = list.filter(r=> new Date(r.createdAt) >= new Date(f.from));
+  if (f.to) list = list.filter(r=> new Date(r.createdAt) <= new Date(f.to + 'T23:59:59'));
+  const {col,dir} = state.sort;
+  list.sort((a,b)=>{
+    let av=a[col], bv=b[col];
+    if (col==='areaHectares'){ av=+av; bv=+bv; }
+    if (av<bv) return dir==='asc'?-1:1;
+    if (av>bv) return dir==='asc'?1:-1;
+    return 0;
+  });
+  return list;
+}
+
+function renderDashboard(){
+  const all = state.farmers;
+  const totalArea = all.reduce((s,r)=>s+(+r.areaHectares||0),0).toFixed(2);
+  const byDistrict = {};
+  ALL_DISTRICTS.forEach(d=>byDistrict[d]=0);
+  all.forEach(r=>byDistrict[r.district] = (byDistrict[r.district]||0)+1);
+  const maxD = Math.max(1, ...Object.values(byDistrict));
+  const byState = {};
+  all.forEach(r=>byState[r.state]=(byState[r.state]||0)+1);
+  const maxS = Math.max(1, ...Object.values(byState));
+
+  const list = filteredFarmers();
+  const sortArrow = (col) => state.sort.col===col ? (state.sort.dir==='asc'?'▲':'▼') : '';
+
+  return `
+  <div class="pagehead">
+    <div class="eyebrow">Overview</div>
+    <h1>Field Registration Dashboard</h1>
+  </div>
+
+  <div class="summary-row">
+    <div class="card sumcard"><div class="lbl">Total Farmers</div><div class="val">${all.length}</div></div>
+    <div class="card sumcard"><div class="lbl">Total Area Covered</div><div class="val">${totalArea} <span class="unit">Ha</span></div></div>
+    <div class="card sumcard"><div class="lbl">Districts Active</div><div class="val">${Object.values(byDistrict).filter(v=>v>0).length} <span class="unit">/ 3</span></div></div>
+    <div class="card sumcard"><div class="lbl">Avg. Land / Farmer</div><div class="val">${all.length? (totalArea/all.length).toFixed(2):'0.00'} <span class="unit">Ha</span></div></div>
+  </div>
+
+  <div class="split-row">
+    <div class="card chart-card">
+      <h3>Records by District</h3>
+      ${ALL_DISTRICTS.map(d=>`
+        <div class="bar-row">
+          <div class="bl">${d}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${(byDistrict[d]/maxD*100)}%"></div></div>
+          <div class="bv">${byDistrict[d]}</div>
+        </div>`).join('')}
+    </div>
+    <div class="card chart-card">
+      <h3>Records by State</h3>
+      ${Object.keys(byState).length? Object.entries(byState).map(([s,v])=>`
+        <div class="bar-row">
+          <div class="bl">${s}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${(v/maxS*100)}%"></div></div>
+          <div class="bv">${v}</div>
+        </div>`).join('') : '<p class="muted" style="font-size:13px;">No records yet.</p>'}
+    </div>
+  </div>
+
+  <div class="card" style="padding:18px 20px;">
+    <div class="toolbar">
+      <input class="search" id="fSearch" placeholder="Search name, village, Khasara no. or Farmer ID…" value="${state.filters.q}" oninput="setFilter('q', this.value)"/>
+      <select id="fState" onchange="setFilter('state', this.value)">
+        <option value="">All States</option>
+        <option value="Madhya Pradesh" ${state.filters.state==='Madhya Pradesh'?'selected':''}>Madhya Pradesh</option>
+        <option value="Rajasthan" ${state.filters.state==='Rajasthan'?'selected':''}>Rajasthan</option>
+      </select>
+      <select id="fDistrict" onchange="setFilter('district', this.value)">
+        <option value="">All Districts</option>
+        ${ALL_DISTRICTS.map(d=>`<option value="${d}" ${state.filters.district===d?'selected':''}>${d}</option>`).join('')}
+      </select>
+      <input type="date" value="${state.filters.from}" onchange="setFilter('from', this.value)" title="From date"/>
+      <input type="date" value="${state.filters.to}" onchange="setFilter('to', this.value)" title="To date"/>
+      <button class="btn btn-ghost btn-sm" onclick="exportCsv()">⭳ Export CSV</button>
+    </div>
+
+    ${list.length===0 ? `
+      <div class="tbl-empty">No records match your filters. <button class="btn btn-ghost btn-sm" onclick="clearFilters()">Clear filters</button></div>
+    ` : `
+    <div style="overflow-x:auto;">
+    <table>
+      <thead><tr>
+        <th onclick="setSort('id')">Farmer ID ${sortArrow('id')}</th>
+        <th onclick="setSort('farmerName')">Name ${sortArrow('farmerName')}</th>
+        <th onclick="setSort('village')">Village ${sortArrow('village')}</th>
+        <th onclick="setSort('district')">District ${sortArrow('district')}</th>
+        <th onclick="setSort('state')">State ${sortArrow('state')}</th>
+        <th onclick="setSort('areaHectares')">Area (Ha) ${sortArrow('areaHectares')}</th>
+        <th>Aadhar</th>
+        <th onclick="setSort('createdAt')">Registered ${sortArrow('createdAt')}</th>
+        <th></th>
+      </tr></thead>
+      <tbody>
+        ${list.map(r=>`
+          <tr>
+            <td class="mono">${r.id}</td>
+            <td>${r.farmerName}</td>
+            <td>${r.village}</td>
+            <td><span class="badge">${r.district}</span></td>
+            <td>${r.state}</td>
+            <td class="mono">${(+r.areaHectares).toFixed(2)}</td>
+            <td class="mono">${maskAadhar(r.aadhar)}</td>
+            <td>${fmtDate(r.createdAt)}</td>
+            <td><button class="btn btn-ghost btn-sm" onclick="openDetail('${r.id}')">View</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    </div>`}
+  </div>`;
+}
+
+function setFilter(k,v){ state.filters[k]=v; render(); setTimeout(()=>{ const el=document.getElementById('fSearch'); if(el && k==='q'){ el.focus(); el.setSelectionRange(v.length, v.length);} },0); }
+function clearFilters(){ state.filters={q:'',state:'',district:'',from:'',to:''}; render(); }
+function setSort(col){
+  if (state.sort.col===col) state.sort.dir = state.sort.dir==='asc'?'desc':'asc';
+  else state.sort = {col, dir:'asc'};
+  render();
+}
+function exportCsv(){
+  const rows = filteredFarmers();
+  const headers = ["Farmer ID","Farmer Name","Father Name","Mobile","Village","District","State","Khasara Number","Area (Ha)","Latitude","Longitude","Registered On"];
+  const lines = [headers.join(',')];
+  rows.forEach(r=>{
+    const row = [r.id, r.farmerName, r.fatherName, r.mobile, r.village, r.district, r.state, r.khasaraNumber, r.areaHectares, r.latitude, r.longitude, fmtDate(r.createdAt)];
+    lines.push(row.map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));
+  });
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'suminter-farmer-records.csv'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ===================== TEAM (ADMIN ONLY) ===================== */
+async function openTeam(){
+  state.busy = true; go('team');
+  const { data, error } = await sb.from('profiles').select('*').order('created_at', {ascending:true});
+  state.busy = false;
+  if (error){ alert('Could not load team: ' + error.message); state.team = []; render(); return; }
+  state.team = data || [];
+  render();
+}
+function renderTeam(){
+  const team = state.team || [];
+  return `
+  <div class="pagehead">
+    <div class="eyebrow">Admin</div>
+    <h1>Team &amp; Access</h1>
+    <p class="muted" style="font-size:13.5px;margin-top:4px;">Promote a Field Staff account to Admin, or demote an Admin back to Field Staff. New sign-ups always start as Field Staff.</p>
+  </div>
+  <div class="card" style="padding:0;overflow:hidden;">
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th>Joined</th><th></th></tr></thead>
+      <tbody>
+        ${team.map(p=>`
+          <tr>
+            <td>${p.full_name}${p.id===state.user.id?' <span class="muted" style="font-size:12px;">(you)</span>':''}</td>
+            <td><span class="badge">${p.role==='admin'?'Admin':'Field Staff'}</span></td>
+            <td>${fmtDate(p.created_at)}</td>
+            <td>
+              ${p.id===state.user.id ? `<span class="muted" style="font-size:12.5px;">—</span>` :
+                p.role==='admin'
+                  ? `<button class="btn btn-ghost btn-sm" onclick="setRole('${p.id}','field_staff')">Demote to Field Staff</button>`
+                  : `<button class="btn btn-primary btn-sm" onclick="setRole('${p.id}','admin')">Promote to Admin</button>`}
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+}
+async function setRole(userId, role){
+  const { error } = await sb.from('profiles').update({ role }).eq('id', userId);
+  if (error){ alert('Could not update role: ' + error.message); return; }
+  await openTeam();
+}
+const STEP_LABELS = ["Farmer Details","Location","Farmer Documents","GPS Capture","Land Details","Land Documents"];
+
+function startForm(){
+  state.wizard = { step:1, data: { nakalDocs: [] }, errors:{} };
+  go('form');
+}
+function editFarmer(id){
+  const f = state.farmers.find(x=>x.id===id);
+  state.wizard = { step:1, data: JSON.parse(JSON.stringify(f)), errors:{}, editing:true };
+  go('form');
+}
+
+function renderForm(){
+  const w = state.wizard;
+  const step = w.step;
+  return `
+  <div class="pagehead">
+    <div class="eyebrow">${w.editing? 'Edit Record' : 'New Registration'}</div>
+    <h1>${w.editing? 'Update Farmer Record' : 'Register a Farmer'}</h1>
+  </div>
+  <div class="steps">
+    ${STEP_LABELS.map((l,i)=>{
+      const n = i+1; const cls = n===step?'active':(n<step?'done':'');
+      return `<div class="step ${cls}"><span class="num">${n<step?'✓':String(n).padStart(2,'0')}</span>${l}</div>`;
+    }).join('')}
+  </div>
+  <div class="card formcard">
+    ${ step===1 ? stepFarmerDetails(w) :
+       step===2 ? stepLocation(w) :
+       step===3 ? stepFarmerDocs(w) :
+       step===4 ? stepGps(w) :
+       step===5 ? stepLandDetails(w) :
+       stepLandDocs(w) }
+  </div>`;
+}
+
+function fieldWrap(id, label, required, innerHtml, err){
+  return `<div class="field ${err?'has-error':''}">
+    <label>${label} ${required?'<span class="req">*</span>':''}</label>
+    ${innerHtml}
+    ${err? `<div class="err">${err}</div>` : ''}
+  </div>`;
+}
+
+function stepFarmerDetails(w){
+  const d = w.data, e = w.errors;
+  return `
+  <h2>👤 Farmer Details</h2>
+  <div class="sub">Basic identity information for the farmer.</div>
+  <div class="grid2">
+    ${fieldWrap('farmerName','Farmer Name',true, `<input id="farmerName" value="${d.farmerName||''}" placeholder="Full name">`, e.farmerName)}
+    ${fieldWrap('fatherName',"Father's Name",true, `<input id="fatherName" value="${d.fatherName||''}" placeholder="Father's full name">`, e.fatherName)}
+    ${fieldWrap('aadhar','Aadhar Number',true, `<input id="aadhar" maxlength="14" value="${d.aadhar? formatAadharDisplay(d.aadhar):''}" placeholder="XXXX-XXXX-XXXX" oninput="onAadharInput(this)">`, e.aadhar)}
+    ${fieldWrap('mobile','Mobile Number',true, `<input id="mobile" maxlength="10" value="${d.mobile||''}" placeholder="10-digit mobile number">`, e.mobile)}
+  </div>
+  <div class="form-nav">
+    <span></span>
+    <button class="btn btn-primary" onclick="wizardNext(1)">Next: Location →</button>
+  </div>`;
+}
+function formatAadharDisplay(digits){
+  const clean = digits.replace(/\D/g,'').slice(0,12);
+  return clean.replace(/(\d{4})(?=\d)/g,'$1-');
+}
+function onAadharInput(el){
+  const digits = el.value.replace(/\D/g,'').slice(0,12);
+  el.value = formatAadharDisplay(digits);
+}
+
+function stepLocation(w){
+  const d = w.data, e = w.errors;
+  const stateVal = d.state || '';
+  const districtOptions = stateVal ? DISTRICTS[stateVal] : ALL_DISTRICTS;
+  return `
+  <h2>📍 Location Details</h2>
+  <div class="sub">Where is this farmer based?</div>
+  <div class="grid2">
+    ${fieldWrap('village','Village',true, `<input id="village" value="${d.village||''}" placeholder="Village name">`, e.village)}
+    ${fieldWrap('state','State',true, `<select id="state" onchange="onStateChange(this.value)">
+        <option value="">Select State</option>
+        <option value="Madhya Pradesh" ${stateVal==='Madhya Pradesh'?'selected':''}>Madhya Pradesh</option>
+        <option value="Rajasthan" ${stateVal==='Rajasthan'?'selected':''}>Rajasthan</option>
+      </select>`, e.state)}
+    ${fieldWrap('district','District',true, `<select id="district">
+        <option value="">Select District</option>
+        ${districtOptions.map(dt=>`<option value="${dt}" ${d.district===dt?'selected':''}>${dt}</option>`).join('')}
+      </select>`, e.district)}
+  </div>
+  <div class="form-nav">
+    <button class="btn btn-ghost" onclick="wizardBack()">← Back</button>
+    <button class="btn btn-primary" onclick="wizardNext(2)">Next: Documents →</button>
+  </div>`;
+}
+function onStateChange(v){ state.wizard.data.state = v; state.wizard.data.district=''; render(); }
+
+function stepFarmerDocs(w){
+  const d = w.data, e = w.errors;
+  return `
+  <h2>🪪 Farmer Documents</h2>
+  <div class="sub">Upload a clear photo or scan of the Aadhar card (.jpg, .png, .pdf — max 5MB).</div>
+  <div class="upload-slot">
+    <div class="thumb">${d.aadharDoc ? (d.aadharDoc.dataUrl ? (d.aadharDoc.type==='application/pdf' ? '📄' : `<img src="${d.aadharDoc.dataUrl}">`) : '📎') : '⬆️'}</div>
+    <div class="meta">
+      <div class="fn">${d.aadharDoc ? d.aadharDoc.name : 'No file selected'}</div>
+      <div class="fm">${d.aadharDoc ? (d.aadharDoc.sizeKb+' KB') : 'JPG, PNG or PDF · max 5MB'}</div>
+    </div>
+    <input type="file" accept=".jpg,.jpeg,.png,.pdf" onchange="handleAadharUpload(event)">
+  </div>
+  ${e.aadharDoc? `<div class="field has-error" style="margin-top:-4px;"><div class="err">${e.aadharDoc}</div></div>`:''}
+  <div class="form-nav">
+    <button class="btn btn-ghost" onclick="wizardBack()">← Back</button>
+    <button class="btn btn-primary" onclick="wizardNext(3)">Next: GPS Capture →</button>
+  </div>`;
+}
+async function handleAadharUpload(evt){
+  const file = evt.target.files[0];
+  if (!file) return;
+  const err = validateFile(file);
+  if (err){ state.wizard.errors.aadharDoc = err; render(); return; }
+  const dataUrl = await fileToDataUrl(file);
+  state.wizard.data.aadharDoc = { name: file.name, type: file.type, dataUrl, sizeKb: Math.round(file.size/1024), file };
+  state.wizard.errors.aadharDoc = null;
+  render();
+}
+function validateFile(file){
+  const okTypes = ['image/jpeg','image/png','application/pdf'];
+  if (!okTypes.includes(file.type)) return 'Only .jpg, .png and .pdf files are allowed.';
+  if (file.size > 5*1024*1024) return 'File exceeds the 5MB size limit.';
+  return null;
+}
+
+function stepGps(w){
+  const d = w.data;
+  return `
+  <h2>🛰️ GPS Location Capture</h2>
+  <div class="sub">Capture the exact field location on-site, or enter coordinates manually.</div>
+  <button class="btn btn-accent" onclick="captureGps()">📍 Capture Current Location</button>
+  <div id="gpsStatus" class="gps-status"></div>
+  <div class="gps-readout">
+    ${fieldWrap('latitude','Latitude',true, `<input id="latitude" type="number" step="0.000001" value="${d.latitude??''}" oninput="onGpsManualInput()" placeholder="e.g. 24.4795">`, w.errors.latitude)}
+    ${fieldWrap('longitude','Longitude',true, `<input id="longitude" type="number" step="0.000001" value="${d.longitude??''}" oninput="onGpsManualInput()" placeholder="e.g. 75.1373">`, w.errors.longitude)}
+  </div>
+  <div id="gpsmap"></div>
+  <div class="form-nav">
+    <button class="btn btn-ghost" onclick="wizardBack()">← Back</button>
+    <button class="btn btn-primary" onclick="wizardNext(4)">Next: Land Details →</button>
+  </div>`;
+}
+let _gpsMapInstance = null, _gpsMarker = null;
+function initGpsMap(){
+  const el = document.getElementById('gpsmap');
+  if (!el || typeof L === 'undefined') return;
+  const d = state.wizard.data;
+  const lat = d.latitude || 24.6, lng = d.longitude || 75.0;
+  _gpsMapInstance = L.map('gpsmap', {zoomControl:false}).setView([lat,lng], d.latitude?13:8);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(_gpsMapInstance);
+  _gpsMarker = L.marker([lat,lng], {draggable:true}).addTo(_gpsMapInstance);
+  _gpsMarker.on('dragend', ()=>{
+    const p = _gpsMarker.getLatLng();
+    state.wizard.data.latitude = +p.lat.toFixed(6);
+    state.wizard.data.longitude = +p.lng.toFixed(6);
+    const la = document.getElementById('latitude'); if(la) la.value = state.wizard.data.latitude;
+    const lo = document.getElementById('longitude'); if(lo) lo.value = state.wizard.data.longitude;
+  });
+}
+function captureGps(){
+  const statusEl = document.getElementById('gpsStatus');
+  statusEl.className = 'gps-status show'; statusEl.textContent = 'Requesting device location…';
+  if (!navigator.geolocation){
+    statusEl.className='gps-status show err'; statusEl.textContent='Geolocation is not supported by this browser.'; return;
+  }
+  navigator.geolocation.getCurrentPosition(pos=>{
+    const lat = +pos.coords.latitude.toFixed(6), lng = +pos.coords.longitude.toFixed(6);
+    state.wizard.data.latitude = lat; state.wizard.data.longitude = lng;
+    document.getElementById('latitude').value = lat;
+    document.getElementById('longitude').value = lng;
+    statusEl.className='gps-status show ok'; statusEl.textContent = `Location captured (±${Math.round(pos.coords.accuracy)}m accuracy).`;
+    if (_gpsMapInstance){ _gpsMapInstance.setView([lat,lng],16); _gpsMarker.setLatLng([lat,lng]); }
+  }, err=>{
+    statusEl.className='gps-status show err'; statusEl.textContent = 'Could not get location: ' + err.message + ' — you can enter coordinates manually below.';
+  }, {enableHighAccuracy:true, timeout:10000});
+}
+function onGpsManualInput(){
+  const lat = parseFloat(document.getElementById('latitude').value);
+  const lng = parseFloat(document.getElementById('longitude').value);
+  state.wizard.data.latitude = isNaN(lat)?undefined:lat;
+  state.wizard.data.longitude = isNaN(lng)?undefined:lng;
+  if (_gpsMapInstance && !isNaN(lat) && !isNaN(lng)){
+    _gpsMapInstance.setView([lat,lng],14); _gpsMarker.setLatLng([lat,lng]);
+  }
+}
+
+function stepLandDetails(w){
+  const d = w.data, e = w.errors;
+  return `
+  <h2>🌾 Land Details</h2>
+  <div class="sub">Survey and area information for the registered land parcel.</div>
+  <div class="grid2">
+    ${fieldWrap('khasaraNumber','Land Survey / Khasara Number',true, `<input id="khasaraNumber" value="${d.khasaraNumber||''}" placeholder="e.g. 142/2">`, e.khasaraNumber)}
+    ${fieldWrap('areaHectares','Area in Hectares',true, `<input id="areaHectares" type="number" step="0.01" min="0" value="${d.areaHectares??''}" placeholder="e.g. 1.85">`, e.areaHectares)}
+  </div>
+  <div class="form-nav">
+    <button class="btn btn-ghost" onclick="wizardBack()">← Back</button>
+    <button class="btn btn-primary" onclick="wizardNext(5)">Next: Land Documents →</button>
+  </div>`;
+}
+
+function stepLandDocs(w){
+  const d = w.data;
+  const docs = d.nakalDocs || [];
+  return `
+  <h2>📑 Land Documents (Nakal Copies)</h2>
+  <div class="sub">Add as many Nakal copies as needed (.jpg, .png, .pdf — max 5MB each).</div>
+  ${docs.map((doc,i)=>`
+    <div class="upload-slot">
+      <div class="thumb">${doc.dataUrl ? (doc.type==='application/pdf' ? '📄' : `<img src="${doc.dataUrl}">`) : '📎'}</div>
+      <div class="meta"><div class="fn">Nakal Copy ${i+1}: ${doc.name}</div><div class="fm">${doc.sizeKb} KB</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="removeNakal(${i})">Remove</button>
+    </div>`).join('')}
+  <div class="upload-slot" style="border-style:dashed;">
+    <div class="thumb">➕</div>
+    <div class="meta"><div class="fn">Add another Nakal copy</div><div class="fm">JPG, PNG or PDF · max 5MB</div></div>
+    <input type="file" accept=".jpg,.jpeg,.png,.pdf" onchange="handleNakalUpload(event)">
+  </div>
+  ${state.wizard.errors.nakalDocs? `<div class="field has-error"><div class="err">${state.wizard.errors.nakalDocs}</div></div>`:''}
+
+  <div class="consent">
+    <input type="checkbox" id="consent" ${d.consent?'checked':''} onchange="toggleConsent(this.checked)">
+    <label for="consent">Farmer consents to data collection for the Suminter India agri-procurement program.</label>
+  </div>
+  ${state.wizard.errors.consent? `<div class="field has-error"><div class="err">${state.wizard.errors.consent}</div></div>`:''}
+
+  <div class="form-nav">
+    <button class="btn btn-ghost" onclick="wizardBack()">← Back</button>
+    <button class="btn btn-accent" ${state.busy?'disabled':''} onclick="submitForm()">${state.busy ? 'Saving…' : (w.editing? 'Save Changes' : 'Submit Registration')}</button>
+  </div>`;
+}
+async function handleNakalUpload(evt){
+  const file = evt.target.files[0];
+  if (!file) return;
+  const err = validateFile(file);
+  if (err){ state.wizard.errors.nakalDocs = err; render(); return; }
+  if ((state.wizard.data.nakalDocs||[]).length >= 5){ state.wizard.errors.nakalDocs = 'Maximum of 5 Nakal copies allowed.'; render(); return; }
+  const dataUrl = await fileToDataUrl(file);
+  state.wizard.data.nakalDocs = state.wizard.data.nakalDocs || [];
+  state.wizard.data.nakalDocs.push({ name:file.name, type:file.type, dataUrl, sizeKb: Math.round(file.size/1024), file });
+  state.wizard.errors.nakalDocs = null;
+  render();
+}
+function removeNakal(i){ state.wizard.data.nakalDocs.splice(i,1); render(); }
+function toggleConsent(v){ state.wizard.data.consent = v; }
+
+/* ---- wizard nav + validation ---- */
+function captureStepInputs(step){
+  const d = state.wizard.data;
+  if (step===1){
+    d.farmerName = document.getElementById('farmerName').value.trim();
+    d.fatherName = document.getElementById('fatherName').value.trim();
+    d.aadhar = document.getElementById('aadhar').value.replace(/\D/g,'');
+    d.mobile = document.getElementById('mobile').value.replace(/\D/g,'');
+  } else if (step===2){
+    d.village = document.getElementById('village').value.trim();
+    d.state = document.getElementById('state').value;
+    d.district = document.getElementById('district').value;
+  } else if (step===5){
+    d.khasaraNumber = document.getElementById('khasaraNumber').value.trim();
+    d.areaHectares = document.getElementById('areaHectares').value;
+  }
+}
+function validateStep(step){
+  const d = state.wizard.data; const errs = {};
+  if (step===1){
+    if (!d.farmerName) errs.farmerName = 'Farmer name is required.';
+    if (!d.fatherName) errs.fatherName = "Father's name is required.";
+    if (!/^\d{12}$/.test(d.aadhar||'')) errs.aadhar = 'Enter a valid 12-digit Aadhar number.';
+    if (!/^[6-9]\d{9}$/.test(d.mobile||'')) errs.mobile = 'Enter a valid 10-digit Indian mobile number.';
+  }
+  if (step===2){
+    if (!d.village) errs.village = 'Village is required.';
+    if (!d.state) errs.state = 'State is required.';
+    if (!d.district) errs.district = 'District is required.';
+  }
+  if (step===3){
+    if (!d.aadharDoc) errs.aadharDoc = 'Please upload the Aadhar card.';
+  }
+  if (step===4){
+    const lat = parseFloat(d.latitude), lng = parseFloat(d.longitude);
+    if (isNaN(lat) || lat < -90 || lat > 90) errs.latitude = 'Enter a valid latitude (-90 to 90).';
+    if (isNaN(lng) || lng < -180 || lng > 180) errs.longitude = 'Enter a valid longitude (-180 to 180).';
+  }
+  if (step===5){
+    if (!d.khasaraNumber) errs.khasaraNumber = 'Khasara number is required.';
+    const area = parseFloat(d.areaHectares);
+    if (isNaN(area) || area <= 0) errs.areaHectares = 'Enter a valid positive area.';
+    else if (!/^\d+(\.\d{1,2})?$/.test(String(d.areaHectares))) errs.areaHectares = 'Max 2 decimal places allowed.';
+  }
+  if (step===6){
+    if (!d.consent) errs.consent = 'Farmer consent is required before submission.';
+  }
+  state.wizard.errors = errs;
+  return Object.keys(errs).length===0;
+}
+function wizardNext(fromStep){
+  captureStepInputs(fromStep);
+  if (!validateStep(fromStep)){ render(); return; }
+  state.wizard.step = fromStep + 1;
+  render();
+  if (state.wizard.step===4) setTimeout(initGpsMap, 30);
+}
+function wizardBack(){
+  state.wizard.step = Math.max(1, state.wizard.step - 1);
+  render();
+  if (state.wizard.step===4) setTimeout(initGpsMap, 30);
+}
+async function uploadDoc(farmerId, slot, file){
+  if (!file) return null;
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+  const path = `${farmerId}/${slot}-${Date.now()}-${safeName}`;
+  const { error } = await sb.storage.from(DOCS_BUCKET).upload(path, file, { upsert:true });
+  if (error){ throw new Error('Upload failed (' + slot + '): ' + error.message); }
+  return path;
+}
+
+async function submitForm(){
+  if (!validateStep(6)){ render(); return; }
+  const d = state.wizard.data;
+  state.busy = true; render();
+  try{
+    if (state.wizard.editing){
+      let aadharPath = d.aadharDoc && d.aadharDoc.path ? d.aadharDoc.path : null;
+      if (d.aadharDoc && d.aadharDoc.file) aadharPath = await uploadDoc(d.id, 'aadhar', d.aadharDoc.file);
+      const nakalPaths = [];
+      for (const doc of (d.nakalDocs||[])){
+        nakalPaths.push(doc.file ? await uploadDoc(d.id, 'nakal', doc.file) : doc.path);
+      }
+      const { error } = await sb.from('farmers').update({
+        farmer_name: d.farmerName, father_name: d.fatherName, aadhar_number: d.aadhar, mobile_number: d.mobile,
+        village: d.village, district: d.district, state: d.state,
+        aadhar_document_path: aadharPath,
+        latitude: parseFloat(d.latitude), longitude: parseFloat(d.longitude),
+        khasara_number: d.khasaraNumber, area_hectares: parseFloat(d.areaHectares),
+        nakal_document_paths: nakalPaths, updated_at: new Date().toISOString(),
+      }).eq('id', d.id);
+      if (error) throw new Error(error.message);
+      await loadFarmers();
+      state.busy = false;
+      go('detail', { detailId: d.id, view:'detail' });
+      return;
+    }
+
+    const id = genFarmerId();
+    const aadharPath = d.aadharDoc && d.aadharDoc.file ? await uploadDoc(id, 'aadhar', d.aadharDoc.file) : null;
+    const nakalPaths = [];
+    for (const doc of (d.nakalDocs||[])){
+      if (doc.file) nakalPaths.push(await uploadDoc(id, 'nakal', doc.file));
+    }
+    const { error } = await sb.from('farmers').insert({
+      id, farmer_name:d.farmerName, father_name:d.fatherName, aadhar_number:d.aadhar, mobile_number:d.mobile,
+      village:d.village, district:d.district, state:d.state,
+      aadhar_document_path: aadharPath,
+      latitude: parseFloat(d.latitude), longitude: parseFloat(d.longitude),
+      khasara_number:d.khasaraNumber, area_hectares: parseFloat(d.areaHectares),
+      nakal_document_paths: nakalPaths, consent:true,
+      created_by: state.user.id, created_by_name: state.user.name,
+    });
+    if (error) throw new Error(error.message);
+    await loadFarmers();
+    state.busy = false;
+    state._lastCreatedId = id;
+    go('success_' + id); // handled below
+  } catch(err){
+    state.busy = false;
+    alert('Could not save this record: ' + err.message);
+    render();
+  }
+}
+
+/* success screen is a pseudo-view rendered via renderBody override */
+const _origRenderBody = renderBody;
+renderBody = function(){
+  if (typeof state.view === 'string' && state.view.startsWith('success_')){
+    return renderSuccess(state.view.replace('success_',''));
+  }
+  return _origRenderBody();
+};
+
+function renderSuccess(id){
+  const r = state.farmers.find(f=>f.id===id);
+  return `
+  <div class="card success-wrap">
+    <div class="checkring">✓</div>
+    <h1 style="font-size:22px;">Registration Complete</h1>
+    <p class="muted" style="font-size:14px;margin-top:6px;">${r.farmerName} has been added to the Suminter India farmer database.</p>
+    <div class="idcard">
+      <div class="ic-top"><div class="ic-org">SUMINTER INDIA</div><div class="stamp" style="border-color:var(--accent);color:var(--accent);transform:rotate(4deg);padding:6px 10px;"><span class="s-label" style="font-size:8px;">Verified</span></div></div>
+      <div class="ic-name">${r.farmerName}</div>
+      <div class="ic-sub">${r.village}, ${r.district}, ${r.state}</div>
+      <div class="ic-id">${r.id}</div>
+      <div class="ic-line"><span>Khasara ${r.khasaraNumber}</span><span>${r.areaHectares} Ha</span></div>
+    </div>
+    <div style="margin-top:26px;display:flex;gap:10px;justify-content:center;">
+      <button class="btn btn-ghost" onclick="go('dashboard')">Back to Dashboard</button>
+      <button class="btn btn-primary" onclick="openDetail('${r.id}')">View Full Record</button>
+    </div>
+  </div>`;
+}
+
+/* ===================== DETAIL VIEW ===================== */
+function openDetail(id){ go('detail', { detailId:id }); setTimeout(()=>initDetailMap(id), 30); }
+function initDetailMap(id){
+  const r = state.farmers.find(f=>f.id===id);
+  const el = document.getElementById('detailmap');
+  if (!el || typeof L==='undefined' || !r) return;
+  const map = L.map('detailmap', {zoomControl:false, dragging:false, scrollWheelZoom:false}).setView([r.latitude, r.longitude], 14);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+  L.marker([r.latitude, r.longitude]).addTo(map);
+}
+function renderDetail(){
+  const r = state.farmers.find(f=>f.id===state.detailId);
+  if (!r) return `<div class="empty-state"><div class="em-icon">🔍</div>Record not found.<br><button class="btn btn-ghost" style="margin-top:12px;" onclick="go('dashboard')">Back to Dashboard</button></div>`;
+  const isAdmin = state.user.role==='admin';
+  const showFull = isAdmin && state.revealAadharId===r.id;
+  return `
+  <div class="pagehead" style="display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:10px;">
+    <div>
+      <div class="eyebrow">Farmer Record · ${r.id}</div>
+      <h1>${r.farmerName}</h1>
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn btn-ghost" onclick="go('dashboard')">← Back</button>
+      ${isAdmin? `<button class="btn btn-primary" onclick="editFarmer('${r.id}')">Edit Record</button>` : ''}
+    </div>
+  </div>
+  <div class="detail-grid">
+    <div>
+      <div class="card detail-section">
+        <h3>Farmer Details</h3>
+        <div class="kv">
+          <div><div class="k">Farmer Name</div><div class="v">${r.farmerName}</div></div>
+          <div><div class="k">Father's Name</div><div class="v">${r.fatherName}</div></div>
+          <div><div class="k">Aadhar Number</div><div class="v mono">${showFull ? formatAadharDisplay(r.aadhar) : maskAadhar(r.aadhar)}
+            ${isAdmin? `<button class="btn btn-ghost btn-sm" style="margin-left:8px;" onclick="toggleReveal('${r.id}')">${showFull?'Hide':'Reveal'}</button>`:''}
+          </div></div>
+          <div><div class="k">Mobile Number</div><div class="v mono">${r.mobile}</div></div>
+        </div>
+      </div>
+      <div class="card detail-section">
+        <h3>Location</h3>
+        <div class="kv">
+          <div><div class="k">Village</div><div class="v">${r.village}</div></div>
+          <div><div class="k">District</div><div class="v">${r.district}</div></div>
+          <div><div class="k">State</div><div class="v">${r.state}</div></div>
+          <div><div class="k">Registered</div><div class="v">${fmtDate(r.createdAt)}</div></div>
+        </div>
+      </div>
+      <div class="card detail-section">
+        <h3>Land Details</h3>
+        <div class="kv">
+          <div><div class="k">Khasara Number</div><div class="v mono">${r.khasaraNumber}</div></div>
+          <div><div class="k">Area</div><div class="v">${r.areaHectares} Ha</div></div>
+        </div>
+      </div>
+      <div class="card detail-section">
+        <h3>Documents</h3>
+        <div class="doclist">
+          ${r.aadharDoc ? `<button class="dchip" style="cursor:pointer;border:1px solid var(--line);" onclick="openDoc('${r.aadharDoc.path}')">🪪 ${r.aadharDoc.name}</button>` : `<span class="muted" style="font-size:13px;">No Aadhar document on file</span>`}
+          ${(r.nakalDocs||[]).map((d,i)=>`<button class="dchip" style="cursor:pointer;border:1px solid var(--line);" onclick="openDoc('${d.path}')">📑 Nakal ${i+1}: ${d.name}</button>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card detail-section">
+        <h3>GPS Location</h3>
+        <div class="kv" style="margin-bottom:12px;">
+          <div><div class="k">Latitude</div><div class="v mono">${r.latitude}</div></div>
+          <div><div class="k">Longitude</div><div class="v mono">${r.longitude}</div></div>
+        </div>
+        <div id="detailmap"></div>
+      </div>
+      <div class="card detail-section" style="text-align:center;">
+        <div class="stamp"><span class="s-label">Farmer ID</span><span class="s-id">${r.id}</span></div>
+      </div>
+    </div>
+  </div>`;
+}
+function toggleReveal(id){ state.revealAadharId = state.revealAadharId===id ? null : id; render(); setTimeout(()=>initDetailMap(id),30); }
+
+async function openDoc(path){
+  if (!path) return;
+  const { data, error } = await sb.storage.from(DOCS_BUCKET).createSignedUrl(path, 300);
+  if (error){ alert('Could not open document: ' + error.message); return; }
+  window.open(data.signedUrl, '_blank');
+}
+
+/* ===================== EVENT WIRING ===================== */
+function attachBodyEvents(){
+  if (state.view==='form' && state.wizard.step===4) setTimeout(initGpsMap, 30);
+  if (state.view==='detail') setTimeout(()=>initDetailMap(state.detailId), 30);
+}
+
+bootstrap();
+</script>
+</body>
+</html>
